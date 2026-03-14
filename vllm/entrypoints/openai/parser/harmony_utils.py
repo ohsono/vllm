@@ -11,6 +11,7 @@ from openai_harmony import (
     Conversation,
     DeveloperContent,
     HarmonyEncodingName,
+    HarmonyError,
     Message,
     ReasoningEffort,
     Role,
@@ -335,7 +336,13 @@ def get_streamable_parser_for_assistant() -> StreamableParser:
 def parse_output_into_messages(token_ids: Iterable[int]) -> StreamableParser:
     parser = get_streamable_parser_for_assistant()
     for token_id in token_ids:
-        parser.process(token_id)
+        try:
+            parser.process(token_id)
+        except HarmonyError as e:
+            logger.warning(
+                "HarmonyError during output parsing, returning partial result: %s", e
+            )
+            break
     return parser
 
 
