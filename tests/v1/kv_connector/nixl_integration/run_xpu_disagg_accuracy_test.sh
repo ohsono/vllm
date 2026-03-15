@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2086,SC2089,SC2090  # unquoted vars and command strings intentionally stored with embedded quotes for bash -c
 set -e
 
 # Hosts / ports

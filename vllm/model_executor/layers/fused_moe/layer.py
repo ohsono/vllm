@@ -1344,10 +1344,11 @@ class FusedMoE(CustomOp):
                 param = getattr(self, param_name)
                 # Fused expert weights can be identified by their 3D tensors
                 if loaded_weight.dim() == 3:
-                    # Repurpose expert_id as shard_idx for deconcatenating w1 and w3
                     if shard_id in {"w1", "w3"}:
-                        shard_idx = expert_id
-                        experts_shard = loaded_weight.chunk(2, dim=1)[shard_idx]
+                        # expert_mapping encodes w1→chunk 0, w3→chunk 1 via
+                        # expert_id (0 or 1); use it as the chunk index here.
+                        chunk_idx = expert_id
+                        experts_shard = loaded_weight.chunk(2, dim=1)[chunk_idx]
                     else:
                         experts_shard = loaded_weight
                     start = 0
@@ -1359,19 +1360,19 @@ class FusedMoE(CustomOp):
 
                 # Unified loading logic for fused and non-fused experts
                 loaded_experts = experts_shard.unbind()
-                for expert_id, loaded_expert in enumerate(loaded_experts, start=start):
+                for eid, loaded_expert in enumerate(loaded_experts, start=start):
                     success = self.weight_loader(
                         param=param,
                         loaded_weight=loaded_expert,
                         weight_name=weight_name,
                         shard_id=shard_id,
-                        expert_id=expert_id,
+                        expert_id=eid,
                         return_success=True,
                     )
                     if success:
                         logger.debug(
                             "Loaded expert %d of shard %s into %s for layer %s",
-                            expert_id,
+                            eid,
                             shard_id,
                             param_name,
                             self.layer_name,

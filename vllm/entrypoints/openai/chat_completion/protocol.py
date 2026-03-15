@@ -160,8 +160,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         deprecated="max_tokens is deprecated in favor of "
         "the max_completion_tokens field",
+        ge=1,
     )
-    max_completion_tokens: int | None = None
+    max_completion_tokens: int | None = Field(default=None, ge=1)
     n: int | None = 1
     presence_penalty: float | None = 0.0
     response_format: AnyResponseFormat | None = None
