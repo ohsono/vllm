@@ -85,9 +85,9 @@ exec /home/ohsono/green/vllm/.venv/bin/python /home/ohsono/green/vllm/.venv/bin/
   `# At 32K ctx: bf16 = ~8 GB, fp8 = ~4 GB per concurrent sequence.` \
   --kv-cache-dtype fp8 \
   \
-  `# Gemma 4 supports up to 256K context natively. 32K covers most real workloads.` \
-  `# Raise to 65536+ for long-context tasks; watch KV cache memory growth.` \
-  --max-model-len 65536 \
+  `# Gemma 4 supports up to 256K context natively. Capped at 49152 (48K) here:` \
+  `# at gpu_memory_utilization=0.80 the engine reports max supported = 51936 tokens.` \
+  --max-model-len 49152 \
   \
   `# 0.85 leaves 15% headroom for CUDA kernels and OS. Lower if you see OOM.` \
   --gpu-memory-utilization 0.80 \
@@ -112,8 +112,8 @@ exec /home/ohsono/green/vllm/.venv/bin/python /home/ohsono/green/vllm/.venv/bin/
   \
   --enable-auto-tool-choice \
   \
-  `# 65536 is a good ceiling for 31B dense without quantization.` \
-  --max-num-batched-tokens 65536 \
+  `# Match max-num-batched-tokens to max-model-len.` \
+  --max-num-batched-tokens 49152 \
   \
   `# fastsafetensors: parallel tensor loading via mmap — faster cold start.` \
   --load-format fastsafetensors \
