@@ -1,18 +1,18 @@
 #!/bin/bash
 # Start vLLM server for Gemma 4 31B Dense (SM 12.1 compatible)
 #
-# MODEL: google/gemma-4-31b-it
+# MODEL: nvidia/Gemma-4-31B-IT-NVFP4  (pre-quantized from google/gemma-4-31b-it)
 #   - Dense multimodal transformer (all 31B params active per token)
 #   - Supports text + image input, text output; 140+ languages
 #   - Context window: up to 256K tokens; limited below for KV cache control
 #
-# MEMORY PROFILE (bf16, no quantization):
-#   Weights:  31B × 2 bytes            = ~62 GB
+# MEMORY PROFILE (NVFP4, --quantization modelopt):
+#   Weights:  ~15-16 GB (NVFP4 vs ~62 GB bf16)
 #   KV cache: scales with max-model-len and max-num-seqs
-#   At 32K ctx, fp8 KV, 1 seq:        = ~4 GB
-#   At 32K ctx, fp8 KV, 32 seqs:      = ~128 GB
-#   Total (32 seqs, 32K, fp8 KV):     = ~190 GB — fits on B200 (192 GB), tight
-#   Recommended: 16 seqs or reduce max-model-len for comfortable headroom
+#   At 49K ctx, fp8 KV, 1 seq:        = ~6 GB
+#   At 49K ctx, fp8 KV, 8 seqs:       = ~48 GB
+#   Total (8 seqs, 49K, fp8 KV):      = ~64 GB — fits on GB10 (87 GB usable) with headroom
+#   Recommended: 8-16 seqs at 0.70 gpu-memory-utilization
 #
 # KV CACHE LEVERS (in order of impact):
 #   1. --max-model-len          : hard cap on sequence length; KV scales linearly
@@ -64,21 +64,21 @@ echo "Port: $PORT"
 echo "Metrics: http://0.0.0.0:${PORT}/metrics"
 echo "========================================================================"
 
-exec /home/ohsono/green/vllm/.venv/bin/python /home/ohsono/green/vllm/.venv/bin/vllm serve google/gemma-4-31b-it \
+exec /home/ohsono/green/vllm/.venv/bin/python /home/ohsono/green/vllm/.venv/bin/vllm serve nvidia/Gemma-4-31B-IT-NVFP4 \
   --host 0.0.0.0 \
   --port "${PORT}" \
   \
   `# Expose both the short alias and the full HF path so clients can use either` \
-  --served-model-name gemma-4-31b-it google/gemma-4-31b-it \
+  --served-model-name gemma-4-31b-it nvidia/Gemma-4-31B-IT-NVFP4 \
   \
-  `# mxfp4 weight quantization (4-bit); reduces 31B from ~62 GB (bf16) to ~15-16 GB.` \
-  `# Frees ~46 GB VRAM for KV cache on GB10 — enables 32-64 seqs at 65K context!` \
-  `# Quality: minimal loss on instruction-following; excellent for dense transformers.` \
-  --quantization mxfp4 \
+  `# NVFP4 pre-quantized checkpoint (nvidia/Gemma-4-31B-IT-NVFP4, ~15-16 GB).` \
+  `# Using pre-quantized NVFP4 instead of runtime --quantization mxfp4 for reliability.` \
+  `# prithivMLmods/gemma-4-31B-it-MXFP4 is a community MXFP4 alternative if needed.` \
+  --quantization modelopt \
   --dtype bfloat16 \
   \
-  `# FlashInfer attention backend: required for FP8 KV cache and prefix caching on SM 12.1.` \
-  `# Triton backend has PTX compilation issues on SM 12.1 — use FlashInfer instead.` \
+  `# Triton attention backend: Gemma4 full-attention layers use global_head_dim=512,` \
+  `# which FlashInfer does not support (max head_dim 256) — must use TRITON_ATTN.` \
   --attention-backend TRITON_ATTN \
   \
   `# FP8 KV cache halves KV memory vs bf16 with negligible quality loss.` \
@@ -89,22 +89,21 @@ exec /home/ohsono/green/vllm/.venv/bin/python /home/ohsono/green/vllm/.venv/bin/
   `# at gpu_memory_utilization=0.80 the engine reports max supported = 51936 tokens.` \
   --max-model-len 49152 \
   \
-  `# 0.85 leaves 15% headroom for CUDA kernels and OS. Lower if you see OOM.` \
-  --gpu-memory-utilization 0.80 \
+  `# 0.70 = 84.7 GiB vLLM budget on 121 GiB unified memory (OS hard floor ~34 GiB).` \
+  `# 0.80 targeted 96.8 GiB but only 87 GiB is truly available → OOM.` \
+  --gpu-memory-utilization 0.70 \
   \
   `# Prefix caching reuses KV cache across requests with shared prefixes (e.g. system prompts).` \
-  `# Required to enable the FlashInfer attention backend on SM 12.1.` \
   --enable-prefix-caching \
   \
   `# Chunked prefill: allows large prompts to be processed in chunks,` \
   `# preventing a single long prefill from blocking the entire batch.` \
   --enable-chunked-prefill \
   \
-  `# 32 concurrent sequences with nvfp4 (15-16 GB weights) + fp8 KV.` \
-  `# At 65K ctx: ~8 GB per seq × 32 = ~256 GB total — cap at 16 seqs for GB10 safety.` \
-  `# Formula: free_vram = 121 - 16 = 105 GB; max_seqs ≈ 105 / (ctx_bytes_per_seq + overhead).` \
-  `# Increase conservatively as you observe runtime memory usage.` \
-  --max-num-seqs 16 \
+  `# 8 concurrent sequences at ctx=49152 with NVFP4 + fp8 KV.` \
+  `# KV budget 65.2 GiB ÷ 7.89 GiB/seq (10 full×49152×16kv×512dim + 50 slide×1024×16kv×256dim) = 8.` \
+  `# Increase to 12 if you reduce max-model-len to 32768 (5.39 GiB/seq → 12 seqs).` \
+  --max-num-seqs 8 \
   \
   --reasoning-parser gemma4 \
   \
@@ -121,9 +120,10 @@ exec /home/ohsono/green/vllm/.venv/bin/python /home/ohsono/green/vllm/.venv/bin/
   --api-key "${VLLM_API_KEY}" 2>&1 | tee -a /home/ohsono/vllm_gemma4_31b.log
 
   # Optional flags — uncomment by removing the leading # and adding \ to the line above:
-  # --quantization mxfp4           # reduce weights to ~16 GB (mxfp4); use if VRAM is tight
   # --max-num-seqs 32              # raise concurrency after confirming KV headroom
-  # --max-model-len 65536          # raise context if 32K isn't enough
+  # --max-model-len 65536          # raise context; watch KV memory
   # --tensor-parallel-size 2       # shard model across 2 GPUs if single GPU is insufficient
   # --enforce-eager                # disable CUDA graph capture; saves ~1-2 GB VRAM
   # --cpu-offload-gb 8             # offload KV cache to Grace CPU memory (GB10/B200 unified pool)
+  # NOTE: to use base model instead: swap model ID to google/gemma-4-31b-it
+  #       and --quantization modelopt → --quantization mxfp4 (runtime quantize; less tested)

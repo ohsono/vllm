@@ -1,18 +1,19 @@
 #!/bin/bash
 # Start vLLM server for Gemma 4 26B-A4B MoE (SM 12.1 compatible)
 #
-# MODEL: google/gemma-4-26B-A4B-it
+# MODEL: nvidia/Gemma-4-26B-A4B-NVFP4  (pre-quantized from google/gemma-4-26B-A4B-it)
 #   - Mixture of Experts: 26B total params, only ~4B active per token
 #   - Supports text + image input, text output; 140+ languages
 #   - Context window: up to 256K tokens; limited below for KV cache control
 #   - MoE delivers ~31B-class quality at ~4B-class inference cost
+#   - NOTE: runtime --quantization mxfp4 CRASHES on this MoE (vllm#39000)
 #
-# MEMORY PROFILE (bf16, no quantization):
-#   Weights:  26B × 2 bytes        = ~52 GB  (all experts loaded, sparse activation)
+# MEMORY PROFILE (NVFP4, --quantization modelopt):
+#   Weights:  ~16.5 GB (NVFP4 vs ~52 GB bf16; 52 tok/s on DGX Spark)
 #   KV cache: shaped by 4B-active attention layers — smaller than a full 26B dense
 #   At 32K ctx, fp8 KV, 1 seq:    = ~2 GB
-#   At 32K ctx, fp8 KV, 64 seqs:  = ~128 GB
-#   Total (64 seqs, 32K, fp8 KV): = ~52 + ~128 GB = ~180 GB — fits on B200 (192 GB)
+#   At 32K ctx, fp8 KV, 32 seqs:  = ~64 GB
+#   Total (32 seqs, 32K, fp8 KV): = ~16.5 + ~64 GB = ~80.5 GB — fits on GB10 (87 GB usable)
 #
 # KV CACHE LEVERS (in order of impact):
 #   1. --max-model-len          : hard cap on sequence length; KV scales linearly
@@ -66,17 +67,18 @@ echo "Port: $PORT"
 echo "Metrics: http://0.0.0.0:${PORT}/metrics"
 echo "========================================================================"
 
-exec /home/ohsono/green/vllm/.venv/bin/python /home/ohsono/green/vllm/.venv/bin/vllm serve google/gemma-4-26B-A4B-it \
+exec /home/ohsono/green/vllm/.venv/bin/python /home/ohsono/green/vllm/.venv/bin/vllm serve nvidia/Gemma-4-26B-A4B-NVFP4 \
   --host 0.0.0.0 \
   --port "${PORT}" \
   \
   `# Expose both the short alias and the full HF path so clients can use either` \
-  --served-model-name gemma-4-26B-A4B-it google/gemma-4-26B-A4B-it \
+  --served-model-name gemma-4-26B-A4B-it nvidia/Gemma-4-26B-A4B-NVFP4 \
   \
-  `# mxfp4 weight quantization (4-bit); reduces MoE 26B from ~52 GB (bf16) to ~13 GB.` \
-  `# Frees ~26 GB VRAM on GB10 for KV concurrency.` \
-  `# MoE + mxfp4 + fp8 KV = 128+ concurrent seqs at 32K context possible.` \
-  --quantization mxfp4 \
+  `# NVFP4 pre-quantized checkpoint (nvidia/Gemma-4-26B-A4B-NVFP4, ~16.5 GB).` \
+  `# Runtime --quantization mxfp4 on this MoE is BROKEN (vllm#39000): 2D weight tensor` \
+  `# vs MXFP4 expecting 3D (num_experts, out, in) → crashes during weight loading.` \
+  `# modelopt loads the pre-quantized NVFP4 weights directly without re-quantizing.` \
+  --quantization modelopt \
   --dtype bfloat16 \
   \
   `# Triton attention backend: required because Gemma4 full-attention layers use` \
@@ -88,13 +90,13 @@ exec /home/ohsono/green/vllm/.venv/bin/python /home/ohsono/green/vllm/.venv/bin/
   --kv-cache-dtype fp8 \
   \
   `# Gemma 4 supports up to 256K context. 32K covers most real workloads.` \
-  `# With 64 seqs at 32K fp8 KV: ~128 GB + 52 GB weights = ~180 GB on B200.` \
+  `# With 32 seqs at 32K fp8 KV: ~64 GB + 16.5 GB weights = ~80.5 GB — fits on GB10.` \
   `# Reduce max-model-len or max-num-seqs if you see OOM at startup.` \
   --max-model-len 32768 \
   \
-  `# 0.90 — MoE weights (~52 GB) are smaller than dense 31B (~62 GB),` \
-  `# leaving more VRAM headroom for KV cache. Raise only if OOM is not a concern.` \
-  --gpu-memory-utilization 0.90 \
+  `# 0.70 = 84.7 GiB vLLM budget on 121 GiB unified memory (OS hard floor ~34 GiB).` \
+  `# NVFP4 weights ~16.5 GiB; 0.90 targeted 108.9 GiB → 21.9 GiB overcommit → OOM.` \
+  --gpu-memory-utilization 0.70 \
   \
   `# Prefix caching reuses KV cache across requests with shared prefixes.` \
   `# Required to enable the FlashInfer attention backend on SM 12.1.` \
@@ -104,10 +106,10 @@ exec /home/ohsono/green/vllm/.venv/bin/python /home/ohsono/green/vllm/.venv/bin/
   `# Especially valuable for MoE where expert routing adds per-token overhead.` \
   --enable-chunked-prefill \
   \
-  `# 64 concurrent sequences with nvfp4 (13 GB weights) + fp8 KV on GB10.` \
-  `# Free VRAM: 121 - 13 = 108 GB. At 32K ctx, MoE KV ≈ ~1.5 GB per seq.` \
-  `# 64 seqs × 1.5 GB = 96 GB + 12 GB headroom — excellent utilization.` \
-  --max-num-seqs 64 \
+  `# 32 concurrent sequences with NVFP4 (~16.5 GB weights) + fp8 KV on GB10.` \
+  `# KV budget: 84.7 - 16.5 - 3.5 = 64.7 GB. At 32K ctx, MoE KV ≈ ~2 GB per seq.` \
+  `# 32 seqs × 2 GB = 64 GB — fits within budget.` \
+  --max-num-seqs 32 \
   \
   `# 32768 matches max-model-len; allows a full sequence worth of tokens per scheduling step.` \
   --max-num-batched-tokens 32768 \
@@ -127,9 +129,10 @@ exec /home/ohsono/green/vllm/.venv/bin/python /home/ohsono/green/vllm/.venv/bin/
   --api-key "${VLLM_API_KEY}" 2>&1 | tee -a /home/ohsono/vllm_gemma4_26b_moe.log
 
   # Optional flags — uncomment by removing the leading # and adding \ to the line above:
-  # --quantization mxfp4           # reduce weights to ~13 GB (mxfp4); aggressive but effective
-  # --max-num-seqs 128             # raise concurrency after confirming KV headroom
+  # --max-num-seqs 64              # raise after confirming KV headroom at runtime
   # --max-model-len 65536          # raise context if 32K isn't enough; watch KV memory
   # --tensor-parallel-size 2       # shard across 2 GPUs for expert parallelism
   # --enforce-eager                # disable CUDA graph capture; saves ~1-2 GB VRAM
   # --cpu-offload-gb 8             # offload KV cache to Grace CPU memory (GB10/B200 unified pool)
+  # WARNING: --quantization mxfp4 on google/gemma-4-26B-A4B-it CRASHES (vllm#39000).
+  #          Use nvidia/Gemma-4-26B-A4B-NVFP4 + --quantization modelopt (this script).
