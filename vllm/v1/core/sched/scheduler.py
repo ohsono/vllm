@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -74,6 +76,11 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# Opt-in per-request KV footprint log (COA-PKV). When set, every request logs
+# one line as its KV blocks are freed: the blocks it held in each KV cache
+# group and their physical bytes. Default off: no behaviour change.
+_LOG_REQUEST_KV = os.environ.get("VLLM_LOG_REQUEST_KV", "0") == "1"
 
 
 class Scheduler(SchedulerInterface):
@@ -2611,6 +2618,8 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        if _LOG_REQUEST_KV:
+            self._log_request_kv(request)
         if self._request_blocks_can_be_freed(request):
             self.kv_cache_manager.free(request)
             return
@@ -2628,6 +2637,62 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.block_pool.free_blocks(blocks)
             return
         self.deferred_frees.append((fence_seq, blocks[::-1]))
+
+    def _log_request_kv(self, request: Request) -> None:
+        """Log the KV blocks `request` holds at the moment they are freed.
+
+        For full attention a request's blocks only grow over its life, and a
+        recurrent (Mamba-style) state is fixed per request, so the count at
+        free is the request's peak physical footprint. Bytes are the pool's own
+        bytes per block (its backing allocation / num_blocks), so the figure is
+        the engine's allocation, not an estimate. Never raises.
+
+        Every device KVCacheTensor names the same backing allocation (cache
+        groups overlay it from byte 0; the worker asserts one shared size), so
+        the pool is that one size, not the sum over tensors.
+        """
+        try:
+            cfg = self.kv_cache_config
+            groups = self.kv_cache_manager.coordinator.get_blocks(request.request_id)
+            pool_bytes = max(
+                (
+                    t.size
+                    for t in cfg.kv_cache_tensors
+                    if not getattr(t, "host_resident", False)
+                ),
+                default=0,
+            )
+            page_bytes = pool_bytes // max(cfg.num_blocks, 1)
+            counts = [sum(not b.is_null for b in blocks) for blocks in groups]
+            per_group = [
+                {
+                    "kind": type(g.kv_cache_spec).__name__,
+                    "block_size": g.kv_cache_spec.block_size,
+                    "blocks": n,
+                }
+                for g, n in zip(cfg.kv_cache_groups, counts)
+            ]
+            total = sum(counts)
+            logger.info(
+                "COAPKV_REQUEST_KV %s",
+                json.dumps(
+                    {
+                        "request_id": request.request_id,
+                        "prompt_tokens": request.num_prompt_tokens,
+                        "output_tokens": request.num_output_tokens,
+                        "preemptions": request.num_preemptions,
+                        "groups": per_group,
+                        "blocks": total,
+                        "page_bytes": page_bytes,
+                        "bytes": total * page_bytes,
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        except Exception as exc:  # the log must never break scheduling
+            logger.warning(
+                "COAPKV_REQUEST_KV failed for %s: %r", request.request_id, exc
+            )
 
     def _drain_deferred_frees(self):
         """Return deferred blocks whose fence step has completed.
