@@ -77,9 +77,10 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
-# Opt-in per-request KV footprint log (COA-PKV). When set, every request logs
-# one line as its KV blocks are freed: the blocks it held in each KV cache
-# group and their physical bytes. Default off: no behaviour change.
+# Opt-in per-request KV footprint log (COA-PKV). When set, each free of a
+# request's KV blocks logs one line, at finish and at every preemption: the
+# blocks it held in each KV cache group and their physical bytes. Default off:
+# no behaviour change.
 _LOG_REQUEST_KV = os.environ.get("VLLM_LOG_REQUEST_KV", "0") == "1"
 
 
@@ -2641,27 +2642,30 @@ class Scheduler(SchedulerInterface):
     def _log_request_kv(self, request: Request) -> None:
         """Log the KV blocks `request` holds at the moment they are freed.
 
-        For full attention a request's blocks only grow over its life, and a
-        recurrent (Mamba-style) state is fixed per request, so the count at
-        free is the request's peak physical footprint. Bytes are the pool's own
-        bytes per block (its backing allocation / num_blocks), so the figure is
-        the engine's allocation, not an estimate. Never raises.
+        Called at finish and at each preemption; ``event`` says which, and
+        ``preemptions`` counts the earlier ones, since the counter is bumped
+        after the free. Bytes are the pool's own bytes per block: every device
+        KVCacheTensor names one backing allocation (the worker asserts a single
+        size), so a page is that size / num_blocks. Never raises.
 
-        Every device KVCacheTensor names the same backing allocation (cache
-        groups overlay it from byte 0; the worker asserts one shared size), so
-        the pool is that one size, not the sum over tensors.
+        The count at free is the peak for full attention and for Mamba outside
+        ``mamba_cache_mode="align"``. Sliding-window, chunked-local and
+        align-mode Mamba groups release blocks mid-request, so their count can
+        understate it. With prefix caching, a shared cache-hit block counts
+        toward every request holding it, and host-resident (HiSparse) groups
+        are priced at the device page.
         """
         try:
             cfg = self.kv_cache_config
             groups = self.kv_cache_manager.coordinator.get_blocks(request.request_id)
-            pool_bytes = max(
-                (
-                    t.size
-                    for t in cfg.kv_cache_tensors
-                    if not getattr(t, "host_resident", False)
-                ),
-                default=0,
-            )
+            sizes = {
+                t.size
+                for t in cfg.kv_cache_tensors
+                if not getattr(t, "host_resident", False)
+            }
+            if len(sizes) > 1:
+                raise ValueError(f"device KV cache tensors have {len(sizes)} sizes")
+            pool_bytes = sizes.pop() if sizes else 0
             page_bytes = pool_bytes // max(cfg.num_blocks, 1)
             counts = [sum(not b.is_null for b in blocks) for blocks in groups]
             per_group = [
@@ -2670,7 +2674,7 @@ class Scheduler(SchedulerInterface):
                     "block_size": g.kv_cache_spec.block_size,
                     "blocks": n,
                 }
-                for g, n in zip(cfg.kv_cache_groups, counts)
+                for g, n in zip(cfg.kv_cache_groups, counts, strict=True)
             ]
             total = sum(counts)
             logger.info(
@@ -2678,6 +2682,7 @@ class Scheduler(SchedulerInterface):
                 json.dumps(
                     {
                         "request_id": request.request_id,
+                        "event": "finish" if request.is_finished() else "preempt",
                         "prompt_tokens": request.num_prompt_tokens,
                         "output_tokens": request.num_output_tokens,
                         "preemptions": request.num_preemptions,
